@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+venv/
+.env
+*.log
+
+# Scan artifacts
+security_report_*.json
+security_report_*.pdf
+
+# IDE and Streamlit configs
+.vscode/
+.idea/
+.streamlit/

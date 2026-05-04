@@ -1,0 +1,7 @@
+streamlit
+celery
+redis
+requests
+fpdf2
+ipwhois
+elasticsearch
