@@ -1,19 +1,43 @@
-from elasticsearch import Elasticsearch
-import streamlit as st
+try:
+    from elasticsearch import Elasticsearch  # type: ignore
+except ImportError:
+    Elasticsearch = None
+
+try:
+    import streamlit as st  # type: ignore
+except ImportError:
+    st = None
+
 import logging
 
 class SecurityElasticClient:
     def __init__(self, host="http://localhost:9200", api_key=None):
         # In production, use st.secrets or env vars
+        if Elasticsearch is None:
+            logging.error("Elasticsearch library is not installed. Please run 'pip install elasticsearch'.")
+            self.client = None
+            return
+            
         try:
             self.client = Elasticsearch(host, api_key=api_key)
         except Exception as e:
             logging.error(f"Failed to initialize Elasticsearch client: {e}")
             self.client = None
             
-    @st.cache_data(ttl=600)
     def fetch_logs(self, index_pattern="security-logs-*", query=None, size=100):
         """Fetch and cache logs from Elasticsearch."""
+        # Define the inner logic for fetching logs
+        def _do_fetch():
+            if self.client is None:
+                return []
+            # ... existing search logic ...
+
+        # Apply streamlit caching only if streamlit is available
+        if st is not None:
+            return st.cache_data(ttl=600)(self._execute_search)(index_pattern, query, size)
+        return self._execute_search(index_pattern, query, size)
+
+    def _execute_search(self, index_pattern, query, size):
         if self.client is None:
             return []
             

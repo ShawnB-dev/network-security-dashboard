@@ -2,13 +2,13 @@ import socket
 import ssl
 import subprocess
 import json
-import requests
+import requests # type: ignore
 from datetime import datetime
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
-from celery import Celery
-import redis
+from celery import Celery # type: ignore
+import redis # type: ignore
 import logging
 
 # Configure logging to see connection issues in the terminal
@@ -27,7 +27,10 @@ celery_app = Celery(
 # --- Caching Layer ---
 try:
     # Using DB 1 for caching to separate from Celery's DB 0 (default)
-    cache_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=1, decode_responses=True, socket_timeout=2)
+    cache_client = redis.Redis(
+        host=REDIS_HOST, port=REDIS_PORT, db=1, 
+        decode_responses=True, socket_timeout=2, socket_connect_timeout=2
+    )
     if cache_client.ping():
         logging.info(f"✅ Redis Cache connected on {REDIS_HOST}:{REDIS_PORT}")
     else:
@@ -35,6 +38,44 @@ try:
 except Exception as e:
     logging.error(f"❌ Redis Cache connection failed: {e}")
     cache_client = None
+
+# --- Orchestration Engine ---
+
+class SecurityDashboardEngine:
+    """
+    Main engine used by the GUI to run synchronous or threaded assessments
+    with progress tracking and cancellation support.
+    """
+    def __init__(self, target: str, stop_event=None, selected_modules=None):
+        self.target = target
+        self.stop_event = stop_event
+        self.modules = selected_modules if selected_modules is not None else []
+
+    def run_assessment(self, progress_callback=None) -> Dict[str, Any]:
+        results = {}
+        total_findings = 0
+        total_modules = len(self.modules)
+
+        for i, module in enumerate(self.modules):
+            if self.stop_event and self.stop_event.is_set():
+                return {"status": "Cancelled"}
+
+            if progress_callback:
+                progress_callback(i, total_modules, module.name)
+
+            findings = module.run(self.target)
+            results[module.name] = [f.to_dict() for f in findings]
+            total_findings += len([f for f in findings if f.severity != "INFO"])
+
+        health_score = max(0, 100 - (total_findings * 10))
+
+        return {
+            "target": self.target,
+            "status": "Healthy" if health_score > 70 else "Action Required",
+            "overall_health_score": health_score,
+            "detailed_findings": results,
+            "resolved_ip": socket.gethostbyname(self.target)
+        }
 
 # --- Asynchronous Task Wrapper ---
 @celery_app.task(bind=True)
@@ -173,12 +214,13 @@ class SSLAuditModule(NetworkSecurityModule):
                     cipher = ssock.cipher()
                     version = ssock.version()
                     
-                    if "TLSv1" in version:
+                    if version and ("TLSv1" in version or "TLSv1.1" in version):
                         findings.append(Finding("HIGH", "Deprecated TLS Version", 
                             f"Host is using {version}.", "Upgrade to TLS 1.2 or 1.3."))
                     
+                    cipher_name = cipher[0] if cipher else "Unknown"
                     findings.append(Finding("INFO", "SSL Health Check", 
-                        f"Using cipher: {cipher[0]}", "Ensure strong ciphers are prioritized."))
+                        f"Using cipher: {cipher_name}", "Ensure strong ciphers are prioritized."))
         except Exception as e:
             findings.append(Finding("LOW", "SSL Not Reachable", str(e), "Verify HTTPS config."))
         return findings
@@ -220,8 +262,8 @@ class CookieSecurityModule(NetworkSecurityModule):
                 if not cookie.secure:
                     findings.append(Finding("HIGH", f"Insecure Cookie: {cookie.name}", 
                         "Cookie is missing the 'Secure' flag.", "Set the 'Secure' attribute on all session cookies."))
-                # Check for HttpOnly (stored in _rest attribute in requests)
-                if 'httponly' not in [k.lower() for k in cookie._rest.keys()]:
+                # Check for HttpOnly flag using the standard public Cookie API
+                if not cookie.has_nonstandard_attr('HttpOnly'):
                     findings.append(Finding("MEDIUM", f"Cookie missing HttpOnly: {cookie.name}", 
                         "Cookie is missing the 'HttpOnly' flag.", "Set 'HttpOnly' to prevent client-side script access."))
         except Exception as e:
@@ -444,7 +486,7 @@ class WhoisLookupModule(NetworkSecurityModule):
 
         try:
             # Inline import to prevent crash if library is missing
-            from ipwhois import IPWhois
+            from ipwhois import IPWhois  # type: ignore
             
             obj = IPWhois(ip)
             # RDAP provides structured JSON data about IP ownership
