@@ -7,7 +7,15 @@ except ImportError:
 
 def create_pdf_report(report):
     """Generates a detailed PDF report from a security scan report dictionary."""
+    import logging
+    
+    # Ensure the report contains necessary keys to prevent KeyError during PDF generation
+    if not report or 'target' not in report:
+        logging.error("Invalid report data provided to PDF generator.")
+        return None
+
     if FPDF is None:
+        logging.error("FPDF2 library not found. PDF generation aborted.")
         return None
 
     class PDF(FPDF):
@@ -56,15 +64,14 @@ def create_pdf_report(report):
 
     pdf.ln(5)
     try:
-        if hasattr(pdf, 'table'):
-            with pdf.table(text_align="CENTER") as table:
-                header = table.row()
-                header.cell("Severity Level")
-                header.cell("Findings Count")
-                for sev, count in severity_summary.items():
-                    row = table.row()
-                    row.cell(sev, background_color=severity_colors_rgb.get(sev))
-                    row.cell(str(count))
+        with pdf.table(text_align="CENTER") as table:
+            header = table.row()
+            header.cell("Severity Level")
+            header.cell("Findings Count")
+            for sev, count in severity_summary.items():
+                row = table.row()
+                row.cell(sev, background_color=severity_colors_rgb.get(sev))
+                row.cell(str(count))
     except (FPDFException, AttributeError, Exception):
         pass
 
@@ -87,4 +94,10 @@ def create_pdf_report(report):
             pdf.ln(2)
         pdf.ln(5)
     
-    return bytes(pdf.output())
+    try:
+        # fpdf2 output() returns a bytearray/bytes object by default when no filename is given.
+        # We return it directly to avoid unnecessary buffer conversions that can trigger WinError 5.
+        return pdf.output()
+    except Exception as e:
+        logging.error(f"Critical error during PDF binary output: {e}")
+        return None

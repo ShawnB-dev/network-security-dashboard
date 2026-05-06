@@ -1,3 +1,4 @@
+# type: ignore
 from ipwhois import IPWhois
 import logging
 

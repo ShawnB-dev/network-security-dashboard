@@ -1,3 +1,4 @@
+# type: ignore
 import pytest
 from modules.security_engine import Finding, WebHeaderAuditModule, PortDiscoveryModule
 

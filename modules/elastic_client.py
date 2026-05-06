@@ -1,10 +1,11 @@
+# type: ignore
 try:
-    from elasticsearch import Elasticsearch  # type: ignore
+    from elasticsearch import Elasticsearch
 except ImportError:
     Elasticsearch = None
 
 try:
-    import streamlit as st  # type: ignore
+    import streamlit as st
 except ImportError:
     st = None
 
