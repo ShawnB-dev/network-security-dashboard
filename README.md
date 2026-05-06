@@ -52,9 +52,20 @@ network-security-dashboard/
 
 2. **Create a virtual environment and install dependencies**:
    ```bash
-   python -m venv venv
-   source venv/Scripts/activate  # On Windows: venv\Scripts\activate
-   pip install -r requirements.txt
+   # Create the environment (defaults to .venv folder)
+   uv venv
+
+   # On Windows: Allow script execution (run once per session if activation fails)
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+
+   # Activate on Windows (PowerShell) - Note the dot in .venv
+   .\.venv\Scripts\Activate.ps1
+
+   # Activate on Linux/macOS
+   source .venv/bin/activate
+
+   # Install dependencies
+   uv pip install -r requirements.txt
    ```
 
 3. **Start Redis**:
@@ -83,6 +94,18 @@ To use the full asynchronous capabilities, you must run the background worker an
 
 - **Test Connectivity**: Run `python test_redis.py` to verify your connection to Redis DB 0 (Celery) and DB 1 (Cache).
 - **Inspect Cache**: Run `python inspect_cache.py` to see the current NVD and WHOIS data stored in your local cache.
+
+### Security Modules
+
+The Network Security Dashboard includes a variety of modules to assess different aspects of network security. Each module targets specific attack vectors and provides actionable findings.
+
+*   **Ping Reachability**
+    *   **Description:** Performs a basic ICMP ping to check if a host is reachable and measures the average latency. This helps in quickly determining host availability.
+    *   **Attack Vector:** Network Reconnaissance, Host Availability.
+*   **Traceroute Path**
+    *   **Description:** Maps the network path (hops) from the scanner to the target host. This can reveal the routing infrastructure and potential points of latency or interception.
+    *   **Attack Vector:** Network Reconnaissance, Path Analysis.
+
 
 ## License
 

@@ -4,12 +4,15 @@ import subprocess
 import json
 import requests
 from datetime import datetime
+import sys
+import re
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 from celery import Celery
 import redis
 import logging
+from .elastic_client import SecurityElasticClient
 
 # Configure logging to see connection issues in the terminal
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,7 +30,10 @@ celery_app = Celery(
 # --- Caching Layer ---
 try:
     # Using DB 1 for caching to separate from Celery's DB 0 (default)
-    cache_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=1, decode_responses=True, socket_timeout=2)
+    cache_client = redis.Redis(
+        host=REDIS_HOST, port=REDIS_PORT, db=1, 
+        decode_responses=True, socket_timeout=2, socket_connect_timeout=2
+    )
     if cache_client.ping():
         logging.info(f"✅ Redis Cache connected on {REDIS_HOST}:{REDIS_PORT}")
     else:
@@ -36,26 +42,58 @@ except Exception as e:
     logging.error(f"❌ Redis Cache connection failed: {e}")
     cache_client = None
 
+# --- Orchestration Engine ---
+
+class SecurityDashboardEngine:
+    """
+    Main engine used by the GUI to run synchronous or threaded assessments
+    with progress tracking and cancellation support.
+    """
+    def __init__(self, target: str, stop_event=None, selected_modules=None):
+        self.target = target
+        self.stop_event = stop_event
+        self.modules = selected_modules if selected_modules is not None else []
+
+    def run_assessment(self, progress_callback=None) -> Dict[str, Any]:
+        results = {}
+        total_findings = 0
+        total_modules = len(self.modules)
+
+        for i, module in enumerate(self.modules):
+            if self.stop_event and self.stop_event.is_set():
+                return {"status": "Cancelled"}
+
+            if progress_callback:
+                progress_callback(i, total_modules, module.name)
+
+            findings = module.run(self.target)
+            results[module.name] = [f.to_dict() for f in findings]
+            total_findings += len([f for f in findings if f.severity != "INFO"])
+
+        health_score = max(0, 100 - (total_findings * 10))
+
+        return {
+            "target": self.target,
+            "status": "Healthy" if health_score > 70 else "Action Required",
+            "overall_health_score": health_score,
+            "detailed_findings": results,
+            "resolved_ip": socket.gethostbyname(self.target)
+        }
+
 # --- Asynchronous Task Wrapper ---
 @celery_app.task(bind=True)
 def run_async_scan(self, target, **kwargs):
     """
     Celery task that initializes the engine and runs all modules.
     """
-    import socket
     logging.info(f"[*] Starting async scan for target: {target}")
     
-    # Initialize the modules
-    modules = [
-        WebHeaderAuditModule(),
-        PortDiscoveryModule(),
-        SSLAuditModule(),
-        CookieSecurityModule(),
-        SensitiveFileModule(),
-        ServiceFingerprintModule(),
-        IPReputationModule(),
-        WhoisLookupModule()
-    ]
+    selected_module_names = kwargs.get('selected_modules', [])
+    if selected_module_names:
+        modules = [MODULE_MAP[name]() for name in selected_module_names if name in MODULE_MAP]
+    else:
+        # Default to a core set if none specified
+        modules = [cls() for cls in [WebHeaderAuditModule, PortDiscoveryModule, SSLAuditModule]]
 
     results = {}
     total_findings = 0
@@ -68,13 +106,31 @@ def run_async_scan(self, target, **kwargs):
     # Calculate a basic health score (starting at 100, -10 per non-info finding)
     health_score = max(0, 100 - (total_findings * 10))
 
-    return {
+    report = {
         "target": target,
         "status": "Healthy" if health_score > 70 else "Action Required",
         "overall_health_score": health_score,
         "detailed_findings": results,
-        "resolved_ip": socket.gethostbyname(target)
+        "resolved_ip": socket.gethostbyname(target),
+        "timestamp": datetime.now().isoformat()
     }
+
+    # 1. Log to Elasticsearch if configured
+    es_host = kwargs.get('es_host')
+    if es_host:
+        es_client = SecurityElasticClient(host=es_host)
+        # Logic to index the report could be added here
+
+    # 2. Trigger Webhook if provided
+    webhook_url = kwargs.get('webhook_url')
+    if webhook_url:
+        try:
+            payload = {"text": f"Scan Complete for {target}. Score: {health_score}/100."}
+            requests.post(webhook_url, json=payload, timeout=5)
+        except Exception as e:
+            logging.error(f"Failed to send webhook: {e}")
+
+    return report
 
 class Finding:
     """Represents a single security vulnerability or health observation."""
@@ -173,12 +229,13 @@ class SSLAuditModule(NetworkSecurityModule):
                     cipher = ssock.cipher()
                     version = ssock.version()
                     
-                    if "TLSv1" in version:
+                    if version and ("TLSv1" in version or "TLSv1.1" in version):
                         findings.append(Finding("HIGH", "Deprecated TLS Version", 
                             f"Host is using {version}.", "Upgrade to TLS 1.2 or 1.3."))
                     
+                    cipher_name = cipher[0] if cipher else "Unknown"
                     findings.append(Finding("INFO", "SSL Health Check", 
-                        f"Using cipher: {cipher[0]}", "Ensure strong ciphers are prioritized."))
+                        f"Using cipher: {cipher_name}", "Ensure strong ciphers are prioritized."))
         except Exception as e:
             findings.append(Finding("LOW", "SSL Not Reachable", str(e), "Verify HTTPS config."))
         return findings
@@ -220,12 +277,37 @@ class CookieSecurityModule(NetworkSecurityModule):
                 if not cookie.secure:
                     findings.append(Finding("HIGH", f"Insecure Cookie: {cookie.name}", 
                         "Cookie is missing the 'Secure' flag.", "Set the 'Secure' attribute on all session cookies."))
-                # Check for HttpOnly (stored in _rest attribute in requests)
-                if 'httponly' not in [k.lower() for k in cookie._rest.keys()]:
+                # Check for HttpOnly flag using the standard public Cookie API
+                if not cookie.has_nonstandard_attr('HttpOnly'):
                     findings.append(Finding("MEDIUM", f"Cookie missing HttpOnly: {cookie.name}", 
                         "Cookie is missing the 'HttpOnly' flag.", "Set 'HttpOnly' to prevent client-side script access."))
         except Exception as e:
             findings.append(Finding("INFO", "Cookie Audit Skipped", str(e), "Check connectivity."))
+        return findings
+
+class SubdomainDiscoveryModule(NetworkSecurityModule):
+    """
+    Probes for common subdomains to identify expanded attack surface.
+    Attack Vector: Reconnaissance of hidden environments.
+    """
+    @property
+    def name(self): return "Subdomain Discovery"
+
+    def run(self, target: str) -> List[Finding]:
+        findings = []
+        common_subs = ["www", "dev", "api", "mail", "vpn", "staging", "test"]
+        discovered = []
+        
+        for sub in common_subs:
+            subdomain = f"{sub}.{target}"
+            try:
+                socket.gethostbyname(subdomain)
+                discovered.append(subdomain)
+            except socket.gaierror:
+                continue
+        
+        if discovered:
+            findings.append(Finding("INFO", "Subdomains Identified", f"Found: {', '.join(discovered)}", "Verify if these environments should be public-facing."))
         return findings
 
 class SensitiveFileModule(NetworkSecurityModule):
@@ -445,14 +527,14 @@ class WhoisLookupModule(NetworkSecurityModule):
         try:
             # Inline import to prevent crash if library is missing
             from ipwhois import IPWhois
-            
+
             obj = IPWhois(ip)
             # RDAP provides structured JSON data about IP ownership
             results = obj.lookup_rdap(depth=1)
-            
+
             asn_description = results.get('asn_description', 'N/A')
             asn_country = results.get('asn_country_code', 'N/A')
-            
+
             findings.append(Finding(
                 "INFO",
                 f"WHOIS Information for {ip}",
@@ -467,5 +549,156 @@ class WhoisLookupModule(NetworkSecurityModule):
         except ImportError:
             findings.append(Finding("INFO", "WHOIS Lookup Skipped", "ipwhois library not installed.", "Run 'pip install ipwhois'."))
         except Exception as e:
+            # Handle PermissionError specifically if WHOIS tries to write to a restricted cache folder
+            if "Permission denied" in str(e) or "WinError 5" in str(e):
+                findings.append(Finding("LOW", "WHOIS Cache Access Denied", "Process lacks write access to WHOIS cache.", "Run terminal as Administrator."))
             findings.append(Finding("INFO", "WHOIS Lookup Failed", str(e), "Verify target and internet connectivity."))
         return findings
+
+# --- New Modules for Ping and Traceroute ---
+
+class PingModule(NetworkSecurityModule):
+    """
+    Performs a basic ping to check host reachability and latency.
+    Attack Vector: Network Reconnaissance, Host Availability.
+    """
+    @property
+    def name(self) -> str:
+        return "Ping Reachability"
+
+    def run(self, target: str) -> List[Finding]:
+        findings = []
+        command = []
+        if sys.platform.startswith('win'):
+            command = ["ping", "-n", "4", target]
+        else:
+            command = ["ping", "-c", "4", target]
+
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                avg_latency = "N/A"
+                if sys.platform.startswith('win'):
+                    # Example: Minimum = 1ms, Maximum = 1ms, Average = 1ms
+                    match = re.search(r"Average = (\d+)ms", result.stdout)
+                    if match:
+                        avg_latency = match.group(1)
+                else:
+                    # Example: rtt min/avg/max/mdev = 0.198/0.229/0.263/0.026 ms
+                    match = re.search(r"rtt min/avg/max/mdev = [\d.]+/([\d.]+)/", result.stdout)
+                    if match:
+                        avg_latency = match.group(1)
+
+                findings.append(Finding(
+                    "INFO",
+                    "Host Reachable",
+                    f"Host {target} is reachable. Avg latency: {avg_latency}ms",
+                    "N/A"
+                ))
+            else:
+                findings.append(Finding(
+                    "HIGH",
+                    "Host Unreachable",
+                    f"Host {target} is unreachable. Error: {result.stderr.strip()}",
+                    "Check network connectivity, firewall rules, or target availability."
+                ))
+        except subprocess.TimeoutExpired:
+            findings.append(Finding(
+                "HIGH",
+                "Ping Timeout",
+                f"Ping to {target} timed out after 10 seconds.",
+                "Target might be down, heavily firewalled, or network is congested."
+            ))
+        except Exception as e:
+            findings.append(Finding(
+                "LOW",
+                "Ping Error",
+                f"An error occurred during ping: {e}",
+                "Ensure ping utility is available and target is valid."
+            ))
+        return findings
+
+class TracerouteModule(NetworkSecurityModule):
+    """
+    Performs a traceroute to map the network path to the target.
+    Attack Vector: Network Reconnaissance, Path Analysis.
+    """
+    @property
+    def name(self) -> str:
+        return "Traceroute Path"
+
+    def run(self, target: str) -> List[Finding]:
+        findings = []
+        command = []
+        if sys.platform.startswith('win'):
+            command = ["tracert", "-d", target] # -d to avoid resolving hostnames for speed
+        else:
+            command = ["traceroute", "-n", target] # -n to avoid resolving hostnames for speed
+
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                hops = []
+                output_lines = result.stdout.splitlines()
+                for line in output_lines:
+                    line = line.strip()
+                    if sys.platform.startswith('win'):
+                        if line.startswith("Tracing route to") or line.startswith("over a maximum of"):
+                            continue
+                        parts = line.split()
+                        if len(parts) >= 4 and parts[0].isdigit():
+                            hops.append(f"{parts[0]}. {parts[-1]}")
+                    else:
+                        if line.startswith("traceroute to") or line.startswith(" "):
+                            continue
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[0].isdigit():
+                            hops.append(f"{parts[0]}. {parts[1]}")
+                
+                hops_string = "\n".join(hops) if hops else "No hops found."
+                
+                findings.append(Finding(
+                    "INFO",
+                    "Network Path Discovered",
+                    f"Path to {target}:\n{hops_string}",
+                    "Analyze the network path for unexpected routing or high latency."
+                ))
+            else:
+                findings.append(Finding(
+                    "LOW",
+                    "Traceroute Failed",
+                    f"Could not trace route to {target}. Error: {result.stderr.strip()}",
+                    "Check network connectivity, firewall rules, or target availability."
+                ))
+        except subprocess.TimeoutExpired:
+            findings.append(Finding(
+                "LOW",
+                "Traceroute Timeout",
+                f"Traceroute to {target} timed out after 30 seconds.",
+                "Target might be down, heavily firewalled, or network is congested."
+            ))
+        except Exception as e:
+            findings.append(Finding(
+                "LOW",
+                "Traceroute Error",
+                f"An error occurred during traceroute: {e}",
+                "Ensure traceroute/tracert utility is available and target is valid."
+            ))
+        return findings
+
+# --- Module Registry ---
+# This MUST remain at the bottom of the file so all classes above are defined
+MODULE_MAP = {
+    "HTTP Security Headers": WebHeaderAuditModule,
+    "Port & Service Discovery": PortDiscoveryModule,
+    "SSL/TLS Security Audit": SSLAuditModule,
+    "DNS Health & Integrity": DNSIntegrityModule,
+    "Cookie Security Audit": CookieSecurityModule,
+    "Subdomain Discovery": SubdomainDiscoveryModule,
+    "Sensitive File Probe": SensitiveFileModule,
+    "Service Fingerprinting": ServiceFingerprintModule,
+    "IP Reputation": IPReputationModule,
+    "WHOIS Lookup": WhoisLookupModule,
+    "Ping Reachability": PingModule,
+    "Traceroute Path": TracerouteModule
+}
